@@ -733,6 +733,9 @@ void Application::initServices() {
       try {
         m_logindService = std::make_unique<LogindService>(*m_systemBus);
         m_logindService->setPrepareForSleepCallback([this](bool sleeping) {
+          if (m_lockScreen.isSessionLocked()) {
+            m_lockScreen.paintSurfacesNow();
+          }
           if (sleeping) {
             return;
           }

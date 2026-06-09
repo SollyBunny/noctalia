@@ -52,6 +52,8 @@ public:
   void onKeyboardEvent(const KeyboardEvent& event);
   [[nodiscard]] bool isActive() const noexcept;
   [[nodiscard]] bool isSessionLocked() const noexcept;
+  /// Synchronously render all configured lock surfaces (e.g. before suspend/resume).
+  void paintSurfacesNow();
 
   template <typename Fn> void forEachSurface(Fn&& fn) {
     for (auto& instance : m_instances) {
@@ -61,8 +63,8 @@ public:
     }
   }
 
-  /// Runs `fn` after the session reaches interactive lock (`m_locked`), or immediately if already locked.
-  /// Used so suspend runs after lock surfaces exist. Cleared if lock fails or the lock request is aborted.
+  /// Runs `fn` after the session is locked and lock surfaces have committed a frame.
+  /// Used so suspend runs only once the compositor has opaque lock buffers. Cleared if lock fails or aborted.
   void runAfterSessionLocked(std::function<void()> fn);
 
   static void handleLocked(void* data, ext_session_lock_v1* lock);
@@ -91,6 +93,7 @@ private:
   void handlePasswordEdited(const std::string& value);
   void tryAuthenticate();
   static void clearSensitiveString(std::string& value);
+  void dispatchPendingAfterLocked();
 
   WaylandConnection* m_wayland = nullptr;
   RenderContext* m_renderContext = nullptr;

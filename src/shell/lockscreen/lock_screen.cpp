@@ -322,17 +322,35 @@ void LockScreen::runAfterSessionLocked(std::function<void()> fn) {
   if (fn == nullptr) {
     return;
   }
+  m_pendingAfterLocked = std::move(fn);
   if (m_locked) {
-    DeferredCall::callLater(std::move(fn));
+    dispatchPendingAfterLocked();
     return;
   }
-  m_pendingAfterLocked = std::move(fn);
   if (isActive()) {
     return;
   }
   if (!lock()) {
     m_pendingAfterLocked = {};
   }
+}
+
+void LockScreen::paintSurfacesNow() {
+  forEachSurface([](LockSurface& surface) { surface.renderNow(); });
+  if (m_wayland != nullptr) {
+    wl_display_flush(m_wayland->display());
+  }
+}
+
+void LockScreen::dispatchPendingAfterLocked() {
+  if (!m_pendingAfterLocked || !m_locked) {
+    return;
+  }
+  auto pending = std::move(m_pendingAfterLocked);
+  DeferredCall::callLater([this, pending = std::move(pending)]() mutable {
+    paintSurfacesNow();
+    DeferredCall::callLater(std::move(pending));
+  });
 }
 
 void LockScreen::handleLocked(void* data, ext_session_lock_v1* /*lock*/) {
@@ -351,9 +369,7 @@ void LockScreen::handleLocked(void* data, ext_session_lock_v1* /*lock*/) {
     self->m_onSessionLocked();
   }
   if (self->m_pendingAfterLocked) {
-    auto pending = std::move(self->m_pendingAfterLocked);
-    self->m_pendingAfterLocked = {};
-    DeferredCall::callLater(std::move(pending));
+    self->dispatchPendingAfterLocked();
   }
 }
 
