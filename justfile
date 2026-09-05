@@ -12,7 +12,7 @@ configure m=mode install_prefix=prefix:
     #!/usr/bin/env bash
     set -euo pipefail
     args=(--buildtype={{ if m == "release" { "release" } else { "debug" } }} -Dcpp_std={{cpp-std}} -Dtests=auto)
-    [[ "{{m}}" == "release" ]] && args+=(-Db_lto=true)
+    # [[ "{{m}}" == "release" ]] && args+=(-Db_lto=true)
     [[ "{{m}}" == "asan"    ]] && args+=(-Db_sanitize=address,undefined)
     if [[ -d "build-{{m}}" ]]; then
         meson setup "build-{{m}}" "${args[@]}" --prefix "{{install_prefix}}" --reconfigure
