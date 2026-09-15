@@ -106,6 +106,15 @@
 
 namespace {
   constexpr Logger kLog("app");
+
+  [[nodiscard]] bool overviewTypeToLaunchEnabled(const ConfigService& configService) {
+    if (compositors::isUmbriel()) {
+      return configService.config().shell.umbrielOverviewTypeToLaunchEnabled;
+    } else if (compositors::isNiri()) {
+      return configService.config().shell.niriOverviewTypeToLaunchEnabled;
+    }
+    return false;
+  }
 } // namespace
 
 void Application::initUi() {
@@ -586,6 +595,7 @@ void Application::initPanelManagerAndPanels() {
           .upower = m_upowerService.get(),
           .powerProfiles = m_powerProfilesService.get(),
           .network = m_networkService.get(),
+          .modem = m_modemManagerService.get(),
           .networkSecrets = m_networkSecretAgent.get(),
           .externalIp = &m_externalIpService,
           .bluetooth = m_bluetoothService.get(),
@@ -661,7 +671,7 @@ void Application::initPanelManagerAndPanels() {
   reloadDmenuProviders();
   reloadPluginPanels();
   m_overviewLauncherCapture.initialize(m_wayland, &m_renderContext, m_compositorPlatform, m_panelManager);
-  m_overviewLauncherCapture.setEnabled(m_configService.config().shell.niriOverviewTypeToLaunchEnabled);
+  m_overviewLauncherCapture.setEnabled(overviewTypeToLaunchEnabled(m_configService));
   m_overviewLauncherCapture.setOpenLauncherCallback(
       [this](std::string_view initialQuery, wl_output* output, std::string_view sourceBarName) {
         if (m_panelManager.isOpenPanel("launcher")) {
@@ -693,7 +703,7 @@ void Application::initPanelManagerAndPanels() {
     m_bar.refresh();
   });
   m_configService.addReloadCallback([this]() {
-    m_overviewLauncherCapture.setEnabled(m_configService.config().shell.niriOverviewTypeToLaunchEnabled);
+    m_overviewLauncherCapture.setEnabled(overviewTypeToLaunchEnabled(m_configService));
   });
   m_overviewLauncherCapture.sync();
   m_panelManager.registerPanel(
@@ -845,6 +855,7 @@ void Application::initBarDockAndLayout() {
       .sysmon = m_systemMonitor.get(),
       .powerProfiles = m_powerProfilesService.get(),
       .network = m_networkService.get(),
+      .modem = m_modemManagerService.get(),
       .externalIp = &m_externalIpService,
       .idleInhibitor = &m_idleInhibitor,
       .mpris = m_mprisService.get(),
