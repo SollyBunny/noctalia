@@ -105,11 +105,17 @@ namespace {
 
     const auto assignments = platform.workspaceWindowAssignments(output);
     for (const auto& assignment : assignments) {
+      if (assignment.minimizeState.has_value() && assignment.minimizeState->minimized) {
+        continue;
+      }
       if (workspaceKeyMatchesAssignment(assignment.workspaceKey, *active)) {
         return true;
       }
     }
     if (!assignments.empty()) {
+      return false;
+    }
+    if (platform.hasUnminimizedToplevels(output) == false) {
       return false;
     }
     return active->occupied;
@@ -268,22 +274,14 @@ namespace {
     const auto outputW = static_cast<float>(outputInfo.effectiveLogicalWidth());
     const auto outputH = static_cast<float>(outputInfo.effectiveLogicalHeight());
 
-    float x = 0.0F;
-    float y = 0.0F;
-    if (aLeft && aRight) {
-      x = mLeft;
-    } else if (aRight) {
+    float x = mLeft;
+    float y = mTop;
+    if (aRight && !aLeft) {
       x = std::max(0.0F, outputW - mRight - surfW);
-    } else {
-      x = mLeft;
     }
 
-    if (aTop && aBottom) {
-      y = mTop;
-    } else if (aBottom) {
+    if (aBottom && !aTop) {
       y = std::max(0.0F, outputH - mBottom - surfH);
-    } else {
-      y = mTop;
     }
     return {x, y};
   }
@@ -309,7 +307,7 @@ namespace {
       std::string_view panelId, std::string_view context, bool toggle
   ) {
     auto& panelManager = PanelManager::instance();
-    if (toggle && panelManager.isOpenPanel(std::string(panelId))) {
+    if (toggle && panelManager.isOpenPanel(panelId)) {
       panelManager.closePanel();
       return;
     }
@@ -330,8 +328,8 @@ namespace {
             .anchorX = anchorX,
             .anchorY = anchorY,
             .hasAnchorPosition = true,
-            .context = std::string(context),
-            .sourceBarName = std::string(sourceBarName),
+            .context = context,
+            .sourceBarName = sourceBarName,
         }
     );
   }
@@ -875,6 +873,44 @@ namespace {
     };
   }
 
+  // Click-through dead zone: one rect per interactive widget, spanning the bar's thickness and padded
+  // along the bar by the capsule padding that widens widget hit targets past their bounds. Spacers and
+  // passive widgets are dead zone (see widgetAtPoint), so they pass through too.
+  [[nodiscard]] std::vector<InputRect> barWidgetsInputRegion(const BarInstance& instance, const InputRect& bar) {
+    const bool isVertical = (instance.barConfig.position == "left" || instance.barConfig.position == "right");
+    const float pad = instance.barConfig.widgetCapsulePadding;
+    std::vector<InputRect> rects;
+    for (const auto* widgets : {&instance.startWidgets, &instance.centerWidgets, &instance.endWidgets}) {
+      for (const auto& widget : *widgets) {
+        const Node* node = widget != nullptr ? widget->outerNode() : nullptr;
+        if (node == nullptr
+            || widget->isBarClickThrough()
+            || !node->visible()
+            || node->width() <= 0.0F
+            || node->height() <= 0.0F) {
+          continue;
+        }
+        float x = 0.0F;
+        float y = 0.0F;
+        Node::absolutePosition(node, x, y);
+        if (isVertical) {
+          const int top = std::max(bar.y, static_cast<int>(std::floor(y - pad)));
+          const int bottom = std::min(bar.y + bar.height, static_cast<int>(std::ceil(y + node->height() + pad)));
+          if (bottom > top) {
+            rects.push_back(InputRect{bar.x, top, bar.width, bottom - top});
+          }
+        } else {
+          const int left = std::max(bar.x, static_cast<int>(std::floor(x - pad)));
+          const int right = std::min(bar.x + bar.width, static_cast<int>(std::ceil(x + node->width() + pad)));
+          if (right > left) {
+            rects.push_back(InputRect{left, bar.y, right - left, bar.height});
+          }
+        }
+      }
+    }
+    return rects;
+  }
+
   std::pair<float, float> computeAutoHideHiddenDelta(
       bool isVertical, bool isBottom, bool isRight, float w, float h, float contentLeft, float contentTop,
       float contentRight, float contentBottom
@@ -1048,7 +1084,7 @@ namespace {
         const float ih = content->height();
         auto memberMainPos = [isVertical](const Node* node) { return isVertical ? node->y() : node->x(); };
         auto memberMainExtent = [isVertical](const Node* node) { return isVertical ? node->height() : node->width(); };
-        auto clearAccordionSuppression = [&run]() {
+        auto clearAccordionSuppression = [&run] {
           for (Widget* widget : run.widgets) {
             if (widget != nullptr) {
               widget->setBarPointerSuppressed(false);
@@ -1104,6 +1140,8 @@ namespace {
             const float progress = std::clamp(run.accordionProgress, 0.0F, 1.0F);
             revealMain = visMain + (fullMain - visMain) * progress;
           }
+          // Match Flex's logical-pixel positions so right-anchored siblings keep a stable rounding phase.
+          revealMain = std::ceil(revealMain);
         }
         // Cross-size is the fixed capsuleCross, independent of per-widget content scale: scaling a widget
         // enlarges its glyph/text inside the fixed-height pill rather than resizing the capsule (so a
@@ -1163,9 +1201,8 @@ namespace {
             } else {
               const float memberStart = contentMain + memberMainPos(node);
               const float memberEnd = memberStart + memberMainExtent(node);
-              widget->setBarPointerSuppressed(
-                  !(memberStart >= padMain - 0.5F && memberEnd <= padMain + revealMain + 0.5F)
-              );
+              const bool memberFullyVisible = memberStart >= padMain - 0.5F && memberEnd <= padMain + revealMain + 0.5F;
+              widget->setBarPointerSuppressed(!memberFullyVisible);
             }
           }
         }
@@ -1464,6 +1501,39 @@ namespace {
     });
   }
 
+  // Walks up from the hovered area to the bar widget that owns it, if any.
+  Widget* widgetFromHoveredArea(BarInstance& instance, InputArea* hoveredArea) {
+    for (const Node* node = hoveredArea; node != nullptr; node = node->parent()) {
+      if (auto it = instance.widgetByRoot.find(node); it != instance.widgetByRoot.end()) {
+        return it->second;
+      }
+    }
+    return nullptr;
+  }
+
+  // An accordion run wants to be expanded while one of its widgets is hovered or, once it has started
+  // unfolding, while the pointer stays anywhere over its capsule (gaps and padding included).
+  bool accordionRunWantsExpansion(const BarInstance& instance, const BarCapsuleRun& run, const Widget* target) {
+    if (target != nullptr && std::ranges::contains(run.widgets, target)) {
+      return true;
+    }
+    return (run.accordionExpanded || run.accordionProgress > 0.0F)
+        && instance.pointerInside
+        && pointInsideNode(run.shell, instance.lastPointerSx, instance.lastPointerSy);
+  }
+
+  // The area the tooltip manager may show a tooltip for: none when the owning widget disables tooltips.
+  InputArea* tooltipAreaForHover(BarInstance& instance, InputArea* hoveredArea) {
+    const Widget* owner = widgetFromHoveredArea(instance, hoveredArea);
+    return owner != nullptr && !owner->showsTooltip() ? nullptr : hoveredArea;
+  }
+
+  bool widgetsWantSecondTicks(const std::vector<std::unique_ptr<Widget>>& widgets) {
+    return std::ranges::any_of(widgets, [](const auto& widget) {
+      return widget != nullptr && widget->wantsSecondTicks();
+    });
+  }
+
 } // namespace
 
 Bar::Bar() = default;
@@ -1504,7 +1574,7 @@ bool Bar::initialize(const BarServices& services) {
   m_lastShadow = m_config->config().shell.shadow;
   m_lastPlugins = m_config->config().plugins;
   m_config->addReloadCallback(
-      [this]() {
+      [this] {
         const auto& cfg = m_config->config();
         if (cfg.bars == m_lastBars
             && cfg.widgets == m_lastWidgets
@@ -1553,10 +1623,19 @@ BarServices Bar::services() const {
 }
 
 void Bar::onSecondTick() {
+  // Without a widget that renders seconds, a full bar update once a minute is
+  // enough, so skip the other 59 ticks instead of re-laying out every surface.
+  const auto minute = std::chrono::floor<std::chrono::minutes>(std::chrono::system_clock::now());
+  const bool minuteChanged = minute != m_lastTickMinute;
+  m_lastTickMinute = minute;
   for (auto& inst : m_instances) {
-    if (inst->surface != nullptr) {
-      inst->surface->requestUpdate();
+    if (inst->surface == nullptr) {
+      continue;
     }
+    if (!minuteChanged && !instanceWantsSecondTicks(*inst)) {
+      continue;
+    }
+    inst->surface->requestUpdate();
   }
 }
 
@@ -1631,7 +1710,7 @@ void Bar::reload() {
   std::erase_if(m_instances, [&](const std::unique_ptr<BarInstance>& instUp) {
     auto& inst = *instUp;
     auto it = newBarsByName.find(inst.barConfig.name);
-    auto destroy = [&]() {
+    auto destroy = [&] {
       if (inst.surface != nullptr) {
         m_surfaceMap.erase(inst.surface->wlSurface());
       }
@@ -1664,17 +1743,15 @@ void Bar::reload() {
     return false;
   });
 
-  if (destroyedAny) {
-    // Drain pending Wayland events for the just-destroyed surfaces before
-    // creating new ones. Without this, the roundtrip inside LayerSurface::initialize
-    // reads stale closures for dead proxies, which libwayland drops without freeing.
-    if (wl_display_roundtrip(m_platform->display()) < 0) {
-      const int roundtripErrno = errno;
-      kLog.error(
-          "Wayland roundtrip failed after destroying stale bar surfaces: {}",
-          m_platform->wayland().describeDisplayError(roundtripErrno)
-      );
-    }
+  // Drain pending Wayland events for the just-destroyed surfaces before
+  // creating new ones. Without this, the roundtrip inside LayerSurface::initialize
+  // reads stale closures for dead proxies, which libwayland drops without freeing.
+  if (destroyedAny && wl_display_roundtrip(m_platform->display()) < 0) {
+    const int roundtripErrno = errno;
+    kLog.error(
+        "Wayland roundtrip failed after destroying stale bar surfaces: {}",
+        m_platform->wayland().describeDisplayError(roundtripErrno)
+    );
   }
 
   syncInstances();
@@ -1709,7 +1786,7 @@ void Bar::onWorkspaceChanged() {
   }
 
   if (anyChanged) {
-    m_workspaceRevealDebounce.start(kWorkspaceRevealDebounce, [this]() { applyPendingWorkspaceReveal(); });
+    m_workspaceRevealDebounce.start(kWorkspaceRevealDebounce, [this] { applyPendingWorkspaceReveal(); });
   }
   scheduleSmartAutoHideReevaluation();
 }
@@ -1719,7 +1796,7 @@ void Bar::scheduleSmartAutoHideReevaluation() {
     return;
   }
   m_smartAutoHideReevalQueued = true;
-  DeferredCall::callLater([this]() {
+  DeferredCall::callLater([this] {
     m_smartAutoHideReevalQueued = false;
     reevaluateSmartAutoHide();
   });
@@ -1754,12 +1831,15 @@ void Bar::reevaluateSmartAutoHide() {
         syncBarSurfaceChrome(*instance);
         needsRedraw = true;
       }
-    } else if (!instance->pointerInside && instance->attachedPopupCount == 0 && !suppressAutoHide) {
-      if ((instance->hideOpacity > 0.0F || pinnedChanged)
-          && (!instance->barConfig.showOnWorkspaceSwitch || !isWorkspacePeekActive())) {
-        startHideFadeOut(*instance);
-        needsRedraw = true;
-      }
+    } else if (
+        !instance->pointerInside
+        && instance->attachedPopupCount == 0
+        && !suppressAutoHide
+        && (instance->hideOpacity > 0.0F || pinnedChanged)
+        && (!instance->barConfig.showOnWorkspaceSwitch || !isWorkspacePeekActive())
+    ) {
+      startHideFadeOut(*instance);
+      needsRedraw = true;
     }
 
     if (needsRedraw && instance->surface != nullptr) {
@@ -1810,7 +1890,7 @@ void Bar::applyPendingWorkspaceReveal() {
     return;
   }
 
-  m_workspacePeekHideTimer.start(kWorkspacePeekHold, [this, peeked = std::move(peeked)]() {
+  m_workspacePeekHideTimer.start(kWorkspacePeekHold, [this, peeked = std::move(peeked)] {
     for (BarInstance* instance : peeked) {
       if (instance == nullptr || !instance->barConfig.isAutoHideEnabled() || instance->pointerInside) {
         continue;
@@ -1821,7 +1901,7 @@ void Bar::applyPendingWorkspaceReveal() {
       const bool suppressAutoHide =
           (m_autoHideSuppressionCallback != nullptr) ? m_autoHideSuppressionCallback(*instance) : false;
       if (!suppressAutoHide) {
-        startHideFadeOut(*instance);
+        startHideFadeOut(*instance, true);
       }
     }
   });
@@ -1886,7 +1966,8 @@ void Bar::rearmTooltipForHoveredWidget() {
   // Same path a real hover takes, so the usual show delay still applies — the
   // tooltip must not blink into existence the instant the panel disappears.
   TooltipManager::instance().onBarHoverChange(
-      hovered, m_hoveredInstance->surface->layerSurface(), m_hoveredInstance->output
+      tooltipAreaForHover(*m_hoveredInstance, hovered), m_hoveredInstance->surface->layerSurface(),
+      m_hoveredInstance->output
   );
 }
 
@@ -1953,7 +2034,7 @@ void Bar::setInstanceIpcVisible(BarInstance& instance, bool visible) {
     if (visible) {
       revealAutoHideBar(instance);
     } else {
-      startHideFadeOut(instance);
+      startHideFadeOut(instance, true);
     }
     return;
   }
@@ -1974,7 +2055,7 @@ void Bar::setInstanceIpcVisible(BarInstance& instance, bool visible) {
         syncBarSlideLayerTransform(*inst);
         syncBarSurfaceChrome(*inst);
       },
-      [inst = &instance, this]() {
+      [inst = &instance, this] {
         syncBarSlideLayerTransform(*inst);
         syncBarAutoHideInputRegion(*inst);
         syncBarSurfaceChrome(*inst);
@@ -2663,23 +2744,23 @@ void Bar::attachWidgetsToSections(BarInstance& instance) {
 
     for (auto& widget : widgets) {
       widget->setAnimationManager(&instance.animations);
-      widget->setUpdateCallback([surface = instance.surface.get()]() {
+      widget->setUpdateCallback([surface = instance.surface.get()] {
         if (surface != nullptr) {
           surface->requestUpdate();
         }
       });
-      widget->setRedrawCallback([surface = instance.surface.get()]() {
+      widget->setRedrawCallback([surface = instance.surface.get()] {
         if (surface != nullptr) {
           surface->requestRedraw();
         }
       });
-      widget->setFrameTickRequestCallback([surface = instance.surface.get()]() {
+      widget->setFrameTickRequestCallback([surface = instance.surface.get()] {
         if (surface != nullptr) {
           surface->requestFrameTick();
         }
       });
       if (auto* plugin = dynamic_cast<PluginWidget*>(widget.get()); plugin != nullptr) {
-        plugin->setUpdateDeferralCallback([]() {
+        plugin->setUpdateDeferralCallback([] {
           auto* panel = PanelManager::current();
           return panel != nullptr && panel->isPanelTransitionActive();
         });
@@ -2921,6 +3002,8 @@ void Bar::attachWidgetsToSections(BarInstance& instance) {
       run.contentScale = widget->contentScale();
       run.hoverBoxes = std::move(hoverBoxes);
       run.accordion = accordion;
+      run.accordionDurationMs = cap.accordionDurationMs.value_or(static_cast<float>(Style::animNormal));
+      run.accordionDelayMs = cap.accordionDelayMs.value_or(0.0F);
       run.accordionClip = clipPtr;
       run.accordionDirection = cap.accordionDirection;
       run.accordionVisibleIndex = accordionStart ? memberOrder.size() - 1 : 0;
@@ -2949,23 +3032,9 @@ void Bar::attachWidgetsToSections(BarInstance& instance) {
   attach(instance.endWidgets, instance.endCapsuleRuns, instance.endSection);
 }
 
-namespace {
-
-  // Walks up from the hovered area to the bar widget that owns it, if any.
-  Widget* widgetFromHoveredArea(BarInstance& instance, InputArea* hoveredArea) {
-    for (const Node* node = hoveredArea; node != nullptr; node = node->parent()) {
-      if (auto it = instance.widgetByRoot.find(node); it != instance.widgetByRoot.end()) {
-        return it->second;
-      }
-    }
-    return nullptr;
-  }
-
-} // namespace
-
 void Bar::updateWidgetHoverHighlight(BarInstance& instance, InputArea* hoveredArea) {
   Widget* target = widgetFromHoveredArea(instance, hoveredArea);
-  if (target != nullptr && target->barHoverBox() == nullptr) {
+  if (target != nullptr && (target->barHoverBox() == nullptr || !target->wantsBarHoverTint())) {
     target = nullptr;
   }
   if (target == instance.hoverHighlightWidget) {
@@ -3001,40 +3070,64 @@ void Bar::animateWidgetHoverHighlight(BarInstance& instance, Widget& widget, boo
   }
 }
 
+void Bar::beginAccordionAnimation(BarInstance& instance, BarCapsuleRun& run, bool expanded) {
+  run.accordionExpanded = expanded;
+  instance.animations.cancelForOwner(run.shell);
+  instance.animations.animate(
+      run.accordionProgress, expanded ? 1.0F : 0.0F, run.accordionDurationMs, Easing::EaseOutCubic,
+      [&run, surface = instance.surface.get()](float progress) {
+        run.accordionProgress = progress;
+        if (surface != nullptr) {
+          surface->requestLayout();
+        }
+      },
+      {}, run.shell
+  );
+}
+
 void Bar::updateAccordionExpansion(BarInstance& instance, InputArea* hoveredArea) {
   Widget* target = widgetFromHoveredArea(instance, hoveredArea);
-
-  auto isPointerInsideRunShell = [&instance](const BarCapsuleRun& run) -> bool {
-    return instance.pointerInside && pointInsideNode(run.shell, instance.lastPointerSx, instance.lastPointerSy);
-  };
 
   bool changed = false;
   auto updateRuns = [&](std::vector<BarCapsuleRun>& runs) {
     for (auto& run : runs) {
       if (!run.accordion || run.shell == nullptr) {
+        run.accordionDelayTimer.stop();
         continue;
       }
-      bool want = target != nullptr && std::ranges::contains(run.widgets, target);
-      if (!want && (run.accordionExpanded || run.accordionProgress > 0.0F)) {
-        if (isPointerInsideRunShell(run)) {
-          want = true;
-        }
-      }
+      const bool want = accordionRunWantsExpansion(instance, run, target);
       if (want == run.accordionExpanded) {
+        run.accordionDelayTimer.stop();
         continue;
       }
-      run.accordionExpanded = want;
-      changed = true;
-      instance.animations.cancelForOwner(run.shell);
-      instance.animations.animate(
-          run.accordionProgress, want ? 1.0F : 0.0F, Style::animNormal, Easing::EaseOutCubic,
-          [&run, surface = instance.surface.get()](float progress) {
-            run.accordionProgress = progress;
-            if (surface != nullptr) {
-              surface->requestLayout();
+      if (!want) {
+        // Collapse stays immediate; a pending expand is void once the pointer leaves.
+        run.accordionDelayTimer.stop();
+        beginAccordionAnimation(instance, run, false);
+        changed = true;
+        continue;
+      }
+      // Expand honors accordion_delay_ms: arm a one-shot and re-verify hover when it fires, so a
+      // pointer that already moved on never unfolds the group.
+      if (run.accordionDelayMs <= 0.0F) {
+        beginAccordionAnimation(instance, run, true);
+        changed = true;
+        continue;
+      }
+      if (run.accordionDelayTimer.active()) {
+        continue;
+      }
+      run.accordionDelayTimer.start(
+          std::chrono::milliseconds(static_cast<int>(run.accordionDelayMs)), [this, &instance, &run] {
+            const Widget* nowTarget = widgetFromHoveredArea(instance, instance.inputDispatcher.hoveredArea());
+            if (run.accordionExpanded || !accordionRunWantsExpansion(instance, run, nowTarget)) {
+              return;
             }
-          },
-          {}, run.shell
+            beginAccordionAnimation(instance, run, true);
+            if (instance.surface != nullptr) {
+              instance.surface->requestLayout();
+            }
+          }
       );
     }
   };
@@ -3049,6 +3142,12 @@ void Bar::updateAccordionExpansion(BarInstance& instance, InputArea* hoveredArea
 
 void Bar::rebuildInstanceContents(BarInstance& instance, const BarConfig& newConfig) {
   noctalia::profiling::ScopedTimer t(kLog, std::format("bar: rebuild contents [{}]", newConfig.name));
+
+  const bool restartHideDelay =
+      instance.autoHideDelayTimer.active() && instance.barConfig.autoHideDelayMs != newConfig.autoHideDelayMs;
+  if (restartHideDelay) {
+    instance.autoHideDelayTimer.stop();
+  }
 
   // Drop any pointer hover/capture state pointing into the widgets we're about
   // to destroy. Hover will be re-acquired on the next pointer motion.
@@ -3107,6 +3206,12 @@ void Bar::rebuildInstanceContents(BarInstance& instance, const BarConfig& newCon
     }
     instance.surface->requestLayout();
   }
+  if (restartHideDelay
+      && !instance.pointerInside
+      && instance.attachedPopupCount == 0
+      && barPointerHideAllowed(instance)) {
+    startHideFadeOut(instance);
+  }
 }
 
 void Bar::tickWidgets(std::vector<std::unique_ptr<Widget>>& widgets, float deltaMs) { ::tickWidgets(widgets, deltaMs); }
@@ -3119,6 +3224,22 @@ bool Bar::instanceNeedsFrameTick(const BarInstance& instance) {
   return widgetsNeedFrameTick(instance.startWidgets)
       || widgetsNeedFrameTick(instance.centerWidgets)
       || widgetsNeedFrameTick(instance.endWidgets);
+}
+
+bool Bar::widgetsWantSecondTicks(const std::vector<std::unique_ptr<Widget>>& widgets) {
+  return ::widgetsWantSecondTicks(widgets);
+}
+
+bool Bar::instanceWantsSecondTicks(const BarInstance& instance) {
+  return widgetsWantSecondTicks(instance.startWidgets)
+      || widgetsWantSecondTicks(instance.centerWidgets)
+      || widgetsWantSecondTicks(instance.endWidgets);
+}
+
+bool Bar::wantsSecondTicks() const {
+  return std::ranges::any_of(m_instances, [](const auto& instance) {
+    return instance != nullptr && instanceWantsSecondTicks(*instance);
+  });
 }
 
 void Bar::applyBackgroundPalette(BarInstance& instance) {
@@ -3139,6 +3260,7 @@ void Bar::syncBarAutoHideInputRegion(BarInstance& instance) const {
   const int surfW = static_cast<int>(instance.surface->width());
   const int surfH = static_cast<int>(instance.surface->height());
   if (!instanceAcceptsPointerInput(instance)) {
+    instance.clickThroughInputRegion.reset();
     instance.surface->setInputRegion({});
     return;
   }
@@ -3147,12 +3269,21 @@ void Bar::syncBarAutoHideInputRegion(BarInstance& instance) const {
         || instance.attachedPopupCount > 0
         || instance.hideOpacity > 0.5F
         || (instance.barConfig.smartAutoHide && instance.smartAutoHidePinnedVisible);
+    instance.clickThroughInputRegion.reset();
     instance.surface->setInputRegion(barAutoHideSurfaceInputRegion(instance.barConfig, surfW, surfH, fullSurface));
     return;
   }
-  instance.surface->setInputRegion(
-      {barContentInputRegion(instance.barConfig, m_config->config().shell.shadow, surfW, surfH)}
-  );
+  const auto barRect = barContentInputRegion(instance.barConfig, m_config->config().shell.shadow, surfW, surfH);
+  if (instance.barConfig.deadZone.clickThrough) {
+    auto rects = barWidgetsInputRegion(instance, barRect);
+    if (instance.clickThroughInputRegion != rects) {
+      instance.surface->setInputRegion(rects);
+      instance.clickThroughInputRegion = std::move(rects);
+    }
+    return;
+  }
+  instance.clickThroughInputRegion.reset();
+  instance.surface->setInputRegion({barRect});
 }
 
 void Bar::revealAutoHideBar(BarInstance& instance) {
@@ -3163,12 +3294,13 @@ void Bar::revealAutoHideBar(BarInstance& instance) {
     return;
   }
 
+  instance.autoHideDelayTimer.stop();
   instance.ipcLayoutReleased = false;
   instance.animations.cancelForOwner(instance.slideRoot);
   const float current = instance.hideOpacity;
   wl_output* output = instance.output;
   const std::string barName = instance.barConfig.name;
-  const auto notifyAttachedPanel = [output, barName]() {
+  const auto notifyAttachedPanel = [output, barName] {
     PanelManager::instance().onAttachedBarRevealSettled(output, barName);
   };
 
@@ -3176,6 +3308,7 @@ void Bar::revealAutoHideBar(BarInstance& instance) {
   if (current >= kSettledThreshold) {
     const int surfW = static_cast<int>(instance.surface->width());
     const int surfH = static_cast<int>(instance.surface->height());
+    instance.clickThroughInputRegion.reset();
     instance.surface->setInputRegion(barAutoHideSurfaceInputRegion(instance.barConfig, surfW, surfH, true));
     syncBarSurfaceChrome(instance);
     instance.surface->requestRedraw();
@@ -3194,6 +3327,7 @@ void Bar::revealAutoHideBar(BarInstance& instance) {
   );
   const int surfW = static_cast<int>(instance.surface->width());
   const int surfH = static_cast<int>(instance.surface->height());
+  instance.clickThroughInputRegion.reset();
   instance.surface->setInputRegion(barAutoHideSurfaceInputRegion(instance.barConfig, surfW, surfH, true));
   syncBarSurfaceChrome(instance);
   instance.surface->requestRedraw();
@@ -3248,10 +3382,31 @@ void Bar::applyBarCompositorBlur(BarInstance& instance) const {
   instance.surface->setBlurRegion(blurStrips);
 }
 
-void Bar::startHideFadeOut(BarInstance& instance) {
+void Bar::startHideFadeOut(BarInstance& instance, bool immediate) {
   if (instance.autoHideDisablePending || instance.smartAutoHidePinnedVisible) {
     return;
   }
+  if (!immediate
+      && instance.barConfig.autoHide
+      && !instance.barConfig.smartAutoHide
+      && instance.barConfig.autoHideDelayMs > 0) {
+    if (!instance.autoHideDelayTimer.active()) {
+      instance.autoHideDelayTimer.start(
+          std::chrono::milliseconds(instance.barConfig.autoHideDelayMs), [this, inst = &instance] {
+            if (inst->pointerInside || inst->attachedPopupCount > 0 || !barPointerHideAllowed(*inst)) {
+              return;
+            }
+            const bool suppressed =
+                (m_autoHideSuppressionCallback != nullptr) ? m_autoHideSuppressionCallback(*inst) : false;
+            if (!suppressed) {
+              startHideFadeOut(*inst, true);
+            }
+          }
+      );
+    }
+    return;
+  }
+  instance.autoHideDelayTimer.stop();
   const float current = instance.hideOpacity;
   instance.animations.animate(
       current, 0.0F, Style::animNormal, Easing::EaseInQuad,
@@ -3260,7 +3415,7 @@ void Bar::startHideFadeOut(BarInstance& instance) {
         syncBarSlideLayerTransform(*inst);
         syncBarSurfaceChrome(*inst);
       },
-      [inst = &instance, this]() {
+      [inst = &instance, this] {
         if (inst->surface == nullptr) {
           return;
         }
@@ -3349,7 +3504,7 @@ void Bar::buildScene(BarInstance& instance, std::uint32_t width, std::uint32_t h
     hoverUnderlay->setSize(static_cast<float>(w), static_cast<float>(h));
     instance.hoverUnderlay = instance.slideRoot->addChild(std::move(hoverUnderlay));
 
-    auto makeSlot = [&instance]() {
+    auto makeSlot = [&instance] {
       auto slot = ui::node({});
       slot->setClipChildren(true);
       return instance.contentClip->addChild(std::move(slot));
@@ -3359,7 +3514,7 @@ void Bar::buildScene(BarInstance& instance, std::uint32_t width, std::uint32_t h
     instance.endSlot = makeSlot();
 
     // Create section boxes
-    auto makeSection = [widgetSpacing, isVertical]() {
+    auto makeSection = [widgetSpacing, isVertical] {
       auto section = ui::flex(
           isVertical ? FlexDirection::Vertical : FlexDirection::Horizontal,
           {
@@ -3386,7 +3541,9 @@ void Bar::buildScene(BarInstance& instance, std::uint32_t width, std::uint32_t h
       if (next != nullptr) {
         next->setTooltipPlacement(tooltipPlacementAwayFromEdge(inst->barConfig.position));
       }
-      TooltipManager::instance().onBarHoverChange(next, inst->surface->layerSurface(), inst->output);
+      TooltipManager::instance().onBarHoverChange(
+          tooltipAreaForHover(*inst, next), inst->surface->layerSurface(), inst->output
+      );
       updateWidgetHoverHighlight(*inst, next);
       updateAccordionExpansion(*inst, next);
     });
@@ -3480,6 +3637,8 @@ void Bar::buildScene(BarInstance& instance, std::uint32_t width, std::uint32_t h
   instance.slideHiddenDy = hiddenDelta.second;
   syncBarSlideLayerTransform(instance);
 
+  // A rebuilt scene may sit on a new surface, so always send the region once.
+  instance.clickThroughInputRegion.reset();
   syncBarAutoHideInputRegion(instance);
   syncBarSurfaceChrome(instance);
 }
@@ -3514,6 +3673,9 @@ void Bar::updateWidgets(BarInstance& instance) {
   updateSection(instance.centerWidgets);
   updateSection(instance.endWidgets);
   layoutBarSections(instance, renderer, barAreaW, barAreaH, padding, isVertical, m_platform);
+  if (instance.barConfig.deadZone.clickThrough) {
+    syncBarAutoHideInputRegion(instance);
+  }
 }
 
 void Bar::prepareFrame(BarInstance& instance, bool needsUpdate, bool needsLayout) {
@@ -3556,6 +3718,10 @@ void Bar::prepareFrame(BarInstance& instance, bool needsUpdate, bool needsLayout
       widget->layout(renderer, barAreaW, barAreaH);
     }
     layoutBarSections(instance, renderer, barAreaW, barAreaH, padding, isVertical, m_platform);
+  }
+  // Click-through input follows the widgets, which move whenever a widget resizes.
+  if (instance.barConfig.deadZone.clickThrough) {
+    syncBarAutoHideInputRegion(instance);
   }
 }
 
@@ -3687,11 +3853,12 @@ bool Bar::onPointerEvent(const PointerEvent& event) {
     consumed = m_hoveredInstance->inputDispatcher.pointerButton(
         sx, sy, event.button, pressed, event.serial, event.time, event.touch
     );
-    if (pressed && !consumed) {
-      if (handleBarDeadZoneButton(*m_hoveredInstance, sx, sy, event.button, m_platform, m_actionDispatcher)) {
-        consumed = true;
-      }
+    if (pressed
+        && !consumed
+        && handleBarDeadZoneButton(*m_hoveredInstance, sx, sy, event.button, m_platform, m_actionDispatcher)) {
+      consumed = true;
     }
+
     break;
   }
   case PointerEvent::Type::Axis: {
@@ -3827,7 +3994,7 @@ std::optional<std::string> Bar::collectBarIpcInstances(
     if (!knownOutputs.empty()) {
       error += " (available: " + StringUtils::join(knownOutputs, ", ") + ")";
     }
-    error += "\n";
+    error += '\n';
     return error;
   }
   if (outputMatches.size() > 1) {
@@ -4033,6 +4200,7 @@ std::string Bar::setBarAutoHideIpc(std::string_view args) {
 
     instance.ipcLayoutReleased = false;
     instance.autoHideDisablePending = false;
+    instance.autoHideDelayTimer.stop();
     instance.animations.cancelForOwner(instance.slideRoot);
 
     instance.barConfig.autoHide = enabled;
@@ -4048,7 +4216,7 @@ std::string Bar::setBarAutoHideIpc(std::string_view args) {
       if (instance.pointerInside || instance.attachedPopupCount > 0 || suppressAutoHide) {
         revealAutoHideBar(instance);
       } else {
-        startHideFadeOut(instance);
+        startHideFadeOut(instance, true);
       }
       return;
     }
@@ -4063,7 +4231,7 @@ std::string Bar::setBarAutoHideIpc(std::string_view args) {
             syncBarSlideLayerTransform(*inst);
             syncBarSurfaceChrome(*inst);
           },
-          [this, inst = &instance, applySurfaceSpec]() {
+          [this, inst = &instance, applySurfaceSpec] {
             inst->autoHideDisablePending = false;
             inst->barConfig.autoHide = false;
             applySurfaceSpec(*inst);
